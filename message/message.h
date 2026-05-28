@@ -1,20 +1,22 @@
 /*  文件说明：
- *  1. 该文件中定义的类用于在事件处理中表示 “请求消息” 和 “响应消息”
- *  2. Message 是基类，用来保存两种消息共有的信息：消息处理的状态和消息首部的信息
- *  3. Request 表示浏览器的请求消息，用来记录其中的重要字段，及事件处理中对请求消息处理了多少
- *  4. Response 表示向客户端回复的响应消息，记录响应消息中待发送的数据，如状态行、首部、消息体、响应消息已发送多少
+ *  1. 定义 HTTP 请求和响应在非阻塞事件处理中的状态对象。
+ *  2. Request 保存请求行、请求头、未消费缓冲区、请求体长度、keep-alive 和上传临时文件状态。
+ *  3. Response 保存路由生成的 ResponseAction、响应头、JSON 响应体、文件 fd 和已发送偏移。
+ *  4. ConnectionManager 按 fd 保存 Request/Response，使同一连接可跨多次 epoll 事件继续处理。
+ *  5. Request 析构时会删除未完成上传的临时文件；Response 析构时会关闭下载文件 fd。
  */
 
 #ifndef MESSAGE_H
 #define MESSAGE_H
 #include <iostream>
 #include <string>
-#include <sstream>
 #include <map>
 #include <unordered_map>
 #include <utility>
 #include <unistd.h>
 
+#include "../router/response_action.h"
+#include "../upload/file_body_status.h"
 
 // 表示 Request 或 Response 中数据的处理状态
 enum MSGSTATUS{
@@ -28,182 +30,47 @@ enum MSGSTATUS{
 // 表示消息体的类型
 enum MSGBODYTYPE{
     FILE_TYPE,      // 消息体是文件
-    HTML_TYPE,      // 消息体是 HTML 页面
+    JSON_TYPE,      // 消息体是 JSON
     EMPTY_TYPE,     // 消息体为空
 };
 
-// 表示服务端常用的 HTTP 响应状态码
-enum HTTPSTATUS{
-    HTTP_OK = 200,                    // 请求处理成功
-    HTTP_FOUND = 302,                 // 请求需要重定向
-    HTTP_BAD_REQUEST = 400,           // 请求参数错误
-    HTTP_UNAUTHORIZED = 401,          // 请求没有通过身份认证
-    HTTP_NOT_FOUND = 404,             // 请求的资源不存在
-    HTTP_CONFLICT = 409,              // 请求和当前资源状态冲突
-    HTTP_PAYLOAD_TOO_LARGE = 413,     // 请求体超过服务器允许的最大长度
-    HTTP_INTERNAL_ERROR = 500         // 服务端处理请求失败
-};
-
-// 当接收文件时，消息体会分不同的部分，用该类型表示文件消息体已经处理到哪个部分
-enum FILEMSGBODYSTATUS{
-    FILE_BEGIN_FLAG,   // 正在获取并处理表示文件开始的标志行
-    FILE_HEAD,         // 正在获取并处理文件属性部分
-    FILE_CONTENT,      // 正在获取并处理文件内容的部分
-    FILE_COMPLETE      // 文件已经处理完成
-};
-
-enum RESPONSEACTIONTYPE{
-    ACTION_NONE,
-    ACTION_LOGIN_PAGE,
-    ACTION_FILE_LIST,
-    ACTION_DOWNLOAD,
-    ACTION_DELETE,
-    ACTION_REDIRECT,
-    ACTION_REGISTER_SUCCESS,
-    ACTION_REGISTER_INVALID,
-    ACTION_REGISTER_DUPLICATE,
-    ACTION_UPLOAD_INVALID,
-    ACTION_UPLOAD_FAILED,
-    ACTION_UPLOAD_TOO_LARGE,
-    ACTION_LOGIN_SUCCESS,
-    ACTION_LOGIN_UNAUTHORIZED,
-    ACTION_ME_SUCCESS,
-    ACTION_ME_UNAUTHORIZED,
-    ACTION_LOGOUT_SUCCESS,
-    ACTION_NOT_FOUND
-};
-
-struct ResponseAction{
-    ResponseAction() : type(ACTION_NONE){
-    }
-
-    explicit ResponseAction(RESPONSEACTIONTYPE actionType) : type(actionType){
-    }
-
-    ResponseAction(RESPONSEACTIONTYPE actionType, const std::string &actionValue)
-        : type(actionType), value(actionValue){
-    }
-
-    RESPONSEACTIONTYPE type;
-    std::string value;
-};
-
-// 定义 Request 和 Response 公共的部分，即消息首部、消息体（可以获取消息首部的某个字段、修改与获取消息体相关的数据）
-class Message{
+// 表示从客户端接收到的一个 HTTP 请求，保存增量解析和上传处理状态。
+class Request{
 public:
-    Message() : status(HANDLE_INIT){  // 默认构造函数，将状态设置为初始值(正在接收/发送头部数据（请求行、请求头）)
+    Request() : status(HANDLE_INIT), keepAlive(false), msgBodyRecvLen(0), fileMsgStatus(FILE_BEGIN_FLAG){
 
     }
-
-public:
-    // 请求消息和响应消息都需要使用的一些成员
-    MSGSTATUS status;                                        // 记录消息的接收状态，表示整个请求报文收到了多少/发送了多少
-
-    std::unordered_map<std::string, std::string> msgHeader;  // 保存消息首部，存储的是键值对（key-value pairs）首部字段 map（如 Content-Type, Content-Length）
-
-private:
-    
-};
-//请求消息
-//继承自 Message，代表从浏览器接收到的 HTTP 请求：
-// 继承 Message，对请求行的修改和获取，保存收到的首部选项
-class Request : public Message{
-public:
-    Request() : Message(), msgBodyRecvLen(0), fileMsgStatus(FILE_BEGIN_FLAG){
-
-    }
-    // 设置与返回请求行相关字段
-    /**
-     * @brief 设置请求行
-     *
-     * 从传入的字符串中提取请求方法、请求资源和HTTP版本，并保存到类中相应的成员变量中。
-     * 比如 GET /index.html HTTP/1.1
-     * @param requestLine 请求行字符串
-     */
-    void setRequestLine(const std::string &requestLine){
-        std::istringstream lineStream(requestLine);
-        // 获取请求方法
-        lineStream >> requestMethod;   // GET/POST等
-        // 获取请求资源
-        // lineStream >> rquestResourse;
-        lineStream >> requestResourse;  // 请求的资源路径
-
-        // 获取http版本
-        lineStream >> httpVersion;  // 协议版本
-        
-    }
-
-    // 对于Request 报文，根据传入的一行首部字符串，向首部保存选项
-    /**
-     * @brief 添加头部选项
-     *
-     * 该函数将传入的头部选项解析并存入 msgHeader 中。
-     * 比如Content-Type: multipart/form-data; boundary=xxx
-     * @param headLine 要解析的头部选项字符串
-     */
-    void addHeaderOpt(const std::string &headLine){
-        std::istringstream lineStream(headLine);    // 以 istringstream 的方式处理头部选项
-
-        std::string key, value;      // 保存键和值的临时量
-
-        lineStream >> key;           // 获取 key
-        if(key.empty()){
-            return;
+    ~Request(){
+        if(!uploadTempFilePath.empty()){
+            unlink(uploadTempFilePath.c_str());
         }
-        key.pop_back();              // 删除键中的冒号 
-        lineStream.get();            // 删除冒号后的空格
-
-        // 读取空格之后所有的数据，遇到 \n 停止，所以 value 中还包含一个 \r
-        getline(lineStream, value);
-        value.pop_back();            // 删除其中的 \r
-        
-        if(key == "Content-Length"){
-            // 保存消息体的长度
-            contentLength = std::stoll(value);
-
-        }else if(key == "Content-Type"){
-            // 分离消息体类型。消息体类型可能是复杂的消息体，类似 Content-Type: multipart/form-data; boundary=---------------------------24436669372671144761803083960
-            
-            // 先找出值中分号的位置
-            std::string::size_type semIndex = value.find(';');
-            // 根据分号查找的结果，保存类型的结果
-            if(semIndex != std::string::npos){
-                msgHeader[key] = value.substr(0, semIndex);
-                std::string::size_type eqIndex = value.find('=', semIndex);
-                key = value.substr(semIndex + 2, eqIndex - semIndex - 2);
-                msgHeader[key] = value.substr(eqIndex + 1);
-            }else{
-                msgHeader[key] = value;
-            }
-            
-        }else{
-            msgHeader[key] = value;
-        }
-
-        
     }
 
 public:
+    MSGSTATUS status;                                        // 记录请求报文处理到哪个阶段
+    std::unordered_map<std::string, std::string> msgHeader;  // 保存消息首部字段
     std::string recvMsg;           // 收到但是还未处理的数据
 
 
     std::string requestMethod;     // 请求消息的请求方法
     std::string requestResourse;    // 请求的资源
+    std::string queryString;        // URI 中 ? 后面的 query string
     std::string httpVersion;       // 请求的HTTP版本
+    bool keepAlive;                 // 当前请求响应发送完成后是否尝试复用连接
 
     long long contentLength = 0;                 // 记录消息体的长度
     long long msgBodyRecvLen;                    // 已经接收的消息体长度
 
-    std::string recvFileName;                    // 如果客户端发送的是文件，记录文件的名字
-    FILEMSGBODYSTATUS fileMsgStatus;             // 记录表示文件的消息体已经处理到哪些部分
+    std::string recvFileName;                    // multipart 上传解析出的文件名
+    std::string uploadTempFilePath;              // 上传时先写入的临时文件路径
+    FILEMSGBODYSTATUS fileMsgStatus;             // multipart 文件体已经处理到哪个阶段
 private:
 
 };
-// 响应消息
-// 继承 Message，对于状态行修改和获取，设置要发送的首部选项
-class Response : public Message{
+// 表示待发送给客户端的 HTTP 响应，保存构造结果和分段发送进度。
+class Response{
 public:
-    Response() : Message(), bodyType(EMPTY_TYPE), beforeBodyMsgLen(0), msgBodyLen(0), fileMsgFd(-1), curStatusHasSendLen(0){
+    Response() : status(HANDLE_INIT), bodyType(EMPTY_TYPE), closeAfterSend(true), beforeBodyMsgLen(0), msgBodyLen(0), fileMsgFd(-1), curStatusHasSendLen(0){
 
     }
     ~Response(){
@@ -213,7 +80,7 @@ public:
     Response(const Response&) = delete;
     Response& operator=(const Response&) = delete;
 
-    Response(Response &&other) noexcept : Message(){
+    Response(Response &&other) noexcept{
         moveFrom(other);
     }
 
@@ -233,6 +100,9 @@ public:
     }
 
 public:
+    MSGSTATUS status;                                        // 记录响应报文发送到了多少
+    std::unordered_map<std::string, std::string> msgHeader;  // 保存消息首部字段
+
     // 保存状态行相关数据
     std::string responseHttpVersion = "HTTP/1.1";
     std::string responseStatusCode;  // 如 200、404
@@ -241,15 +111,16 @@ public:
     // 以下成员主要用于在发送响应消息时暂存相关的数据
 
     MSGBODYTYPE bodyType;                                 // 消息的类型
-    ResponseAction action;                                // HandleRecv 传给 HandleSend 的类型化响应动作
-    std::string bodyFileName;                             // 要发送数据的路径
+    ResponseAction action;                                // 路由层传给响应构造层的类型化业务动作
+    std::string bodyFileName;                             // 文件响应对应的下载文件名
     std::string username;                                 // 当前响应所属的用户
+    bool closeAfterSend;                                  // 当前响应发送完成后是否关闭连接
 
 
     std::string beforeBodyMsg;                            // 消息体之前的所有数据
     size_t beforeBodyMsgLen;                              // 消息体之前的所有数据的长度
 
-    std::string msgBody;                                  // 在字符串中保存 HTML 类型的消息体
+    std::string msgBody;                                  // 在字符串中保存 JSON 类型的消息体
     unsigned long msgBodyLen;                             // 消息体的长度
 
     int fileMsgFd;                                        // 文件类型的消息体保存文件描述符
@@ -266,6 +137,7 @@ private:
         action = std::move(other.action);
         bodyFileName = std::move(other.bodyFileName);
         username = std::move(other.username);
+        closeAfterSend = other.closeAfterSend;
         beforeBodyMsg = std::move(other.beforeBodyMsg);
         beforeBodyMsgLen = other.beforeBodyMsgLen;
         msgBody = std::move(other.msgBody);

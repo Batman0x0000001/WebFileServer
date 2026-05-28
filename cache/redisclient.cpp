@@ -5,7 +5,7 @@
 #include <iostream>
 
 #include "../config/config.h"
-#include "../utils/utils.h"
+#include "../utils/log.h"
 
 RedisClient::RedisClient() : m_isReady(false){
 }
@@ -20,6 +20,22 @@ RedisClient::~RedisClient(){
 RedisClient& RedisClient::instance(){
     static RedisClient client;
     return client;
+}
+
+RedisClient::ConnectionGuard::ConnectionGuard(RedisClient &client)
+    : m_client(client), m_context(client.acquireConnection()){
+}
+
+RedisClient::ConnectionGuard::~ConnectionGuard(){
+    m_client.releaseConnection(m_context);
+}
+
+void* RedisClient::ConnectionGuard::get() const{
+    return m_context;
+}
+
+RedisClient::ConnectionGuard::operator bool() const{
+    return m_context != nullptr;
 }
 
 bool RedisClient::init(){
@@ -49,7 +65,8 @@ bool RedisClient::init(){
 }
 
 void* RedisClient::createConnection(){
-    redisContext *context = redisConnect(AppConfig::instance().redisHost().c_str(), AppConfig::instance().redisPort());
+    redisContext *context = redisConnect(AppConfig::instance().redisHost().c_str(),
+                                        AppConfig::instance().redisPort());
     if(context == nullptr || context->err){
         if(context != nullptr){
             std::cout << outHead("error") << "Redis 连接失败：" << context->errstr << std::endl;
@@ -61,7 +78,9 @@ void* RedisClient::createConnection(){
     }
 
     if(!AppConfig::instance().redisPassword().empty()){
-        redisReply *reply = static_cast<redisReply*>(redisCommand(context, "AUTH %s", AppConfig::instance().redisPassword().c_str()));
+        redisReply *reply = static_cast<redisReply*>(redisCommand(context,
+                                                    "AUTH %s",
+                                                    AppConfig::instance().redisPassword().c_str()));
         if(reply == nullptr || reply->type == REDIS_REPLY_ERROR){
             std::cout << outHead("error") << "Redis AUTH 失败" << std::endl;
             if(reply != nullptr){
@@ -92,6 +111,17 @@ void* RedisClient::acquireConnection(){
     }
     void *context = m_pool.back();
     m_pool.pop_back();
+    redisReply *reply = static_cast<redisReply*>(redisCommand(static_cast<redisContext*>(context), "PING"));
+    if(reply == nullptr || reply->type == REDIS_REPLY_ERROR){
+        std::cout << outHead("error") << "Redis 连接已断开，尝试重连" << std::endl;
+        if(reply != nullptr){
+            freeReplyObject(reply);
+        }
+        closeConnection(context);
+        context = createConnection();
+    }else{
+        freeReplyObject(reply);
+    }
     return context;
 }
 
@@ -107,34 +137,33 @@ void RedisClient::releaseConnection(void *context){
 }
 
 bool RedisClient::setex(const std::string &key, int ttl, const std::string &value){
-    void *context = acquireConnection();
-    if(context == nullptr){
+    ConnectionGuard guard(*this);
+    if(!guard){
         return false;
     }
 
-    redisReply *reply = static_cast<redisReply*>(redisCommand(static_cast<redisContext*>(context),
-                                                              "SETEX %s %d %s",
-                                                              key.c_str(), ttl, value.c_str()));
+    redisReply *reply = static_cast<redisReply*>(redisCommand(static_cast<redisContext*>(guard.get()),
+                                                              "SETEX %b %d %b",
+                                                              key.data(), key.size(),
+                                                              ttl,
+                                                              value.data(), value.size()));
     if(reply == nullptr){
-        releaseConnection(context);
         return false;
     }
     bool ok = (reply->type == REDIS_REPLY_STATUS && std::string(reply->str) == "OK");
     freeReplyObject(reply);
-    releaseConnection(context);
     return ok;
 }
 
 bool RedisClient::get(const std::string &key, std::string &value){
-    void *context = acquireConnection();
-    if(context == nullptr){
+    ConnectionGuard guard(*this);
+    if(!guard){
         return false;
     }
 
-    redisReply *reply = static_cast<redisReply*>(redisCommand(static_cast<redisContext*>(context),
+    redisReply *reply = static_cast<redisReply*>(redisCommand(static_cast<redisContext*>(guard.get()),
                                                               "GET %s", key.c_str()));
     if(reply == nullptr){
-        releaseConnection(context);
         return false;
     }
 
@@ -144,23 +173,20 @@ bool RedisClient::get(const std::string &key, std::string &value){
         ok = true;
     }
     freeReplyObject(reply);
-    releaseConnection(context);
     return ok;
 }
 
 bool RedisClient::del(const std::string &key){
-    void *context = acquireConnection();
-    if(context == nullptr){
+    ConnectionGuard guard(*this);
+    if(!guard){
         return false;
     }
 
-    redisReply *reply = static_cast<redisReply*>(redisCommand(static_cast<redisContext*>(context),
+    redisReply *reply = static_cast<redisReply*>(redisCommand(static_cast<redisContext*>(guard.get()),
                                                               "DEL %s", key.c_str()));
     if(reply == nullptr){
-        releaseConnection(context);
         return false;
     }
     freeReplyObject(reply);
-    releaseConnection(context);
     return true;
 }

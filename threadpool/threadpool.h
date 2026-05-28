@@ -1,7 +1,8 @@
 /*  文件说明：
- *  1. 用于创建线程池
- *  2. 每个线程中等待事件队列中添加新事件（EventBase 指针指向的派生类）
- *  3. 有新事件时，分配给一个线程处理，线程中调用事件的 process() 方法处理该事件
+ *  1. 定义固定大小的事件处理线程池。
+ *  2. WebServer 主线程只负责 epoll_wait 和投递事件，工作线程从队列中取出 EventBase 并调用 process()。
+ *  3. 事件对象使用 std::unique_ptr 管理，避免任务入队和执行过程中的所有权不清。
+ *  4. 析构时会通知所有工作线程退出并 join，保证服务端关闭时事件对象安全释放。
  */
 #ifndef THREADPOOL_H
 #define THREADPOOL_H
@@ -14,19 +15,20 @@
 #include <thread>
 #include <vector>
 
-#include "../event/myevent.h"
+class EventBase;
 
 class ThreadPool{
 public:
-    // 初始化线程池、互斥访问时间队列的互斥量、表示队列中事件的信号量
+    // 初始化固定数量工作线程；线程启动后阻塞等待事件队列。
     ThreadPool(int threadNum);
+    // 通知所有线程退出并等待 join，保证事件对象安全释放。
     ~ThreadPool();
 public:
-    // 向事件队列中添加一个待处理的事件，线程池中的线程会循环处理其中的事件
+    // 向事件队列中添加一个待处理事件；返回值用于调用方判断是否入队成功。
     int appendEvent(std::unique_ptr<EventBase> event, const std::string &eventType);
 
 private:
-    // 在线程中执行该函数等待处理事件队列中的事件
+    // 工作线程主循环：取事件、释放队列锁、调用 EventBase::process()。
     void run(int threadNo);
 
 private:
@@ -35,8 +37,8 @@ private:
     bool m_isStop;                    // 标识线程池是否正在停止
     
     std::queue<std::unique_ptr<EventBase> > m_workQueue;  // 保存所有待处理的事件
-    std::mutex queueLocker;          // 用于互斥访问事件队列的锁
-    std::condition_variable queueCond; // 表示队列中事件个数变化的条件变量
+    std::mutex m_queueMutex;          // 用于互斥访问事件队列的锁
+    std::condition_variable m_queueCond; // 表示队列中事件个数变化的条件变量
 
 };
 

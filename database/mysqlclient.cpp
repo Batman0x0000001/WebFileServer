@@ -5,7 +5,7 @@
 #include <vector>
 
 #include "../config/config.h"
-#include "../utils/utils.h"
+#include "../utils/log.h"
 
 MysqlClient::MysqlClient() : m_isReady(false){
 }
@@ -20,6 +20,22 @@ MysqlClient::~MysqlClient(){
 MysqlClient& MysqlClient::instance(){
     static MysqlClient client;
     return client;
+}
+
+MysqlClient::ConnectionGuard::ConnectionGuard(MysqlClient &client)
+    : m_client(client), m_mysql(client.acquireConnection()){
+}
+
+MysqlClient::ConnectionGuard::~ConnectionGuard(){
+    m_client.releaseConnection(m_mysql);
+}
+
+void* MysqlClient::ConnectionGuard::get() const{
+    return m_mysql;
+}
+
+MysqlClient::ConnectionGuard::operator bool() const{
+    return m_mysql != nullptr;
 }
 
 bool MysqlClient::init(){
@@ -45,6 +61,7 @@ bool MysqlClient::init(){
 
     m_isReady = true;
     std::cout << outHead("info") << "MySQL 连接池初始化成功，连接数：" << poolSize << std::endl;
+
     return true;
 }
 
@@ -88,6 +105,11 @@ void* MysqlClient::acquireConnection(){
     }
     void *mysql = m_pool.back();
     m_pool.pop_back();
+    if(mysql_ping(static_cast<MYSQL*>(mysql)) != 0){
+        std::cout << outHead("error") << "MySQL 连接已断开，尝试重连" << std::endl;
+        closeConnection(mysql);
+        mysql = createConnection();
+    }
     return mysql;
 }
 
@@ -122,105 +144,4 @@ bool MysqlClient::execute(void *mysql, const std::string &sql){
         return false;
     }
     return true;
-}
-
-bool MysqlClient::userExists(const std::string &username){
-    void *mysql = acquireConnection();
-    if(mysql == nullptr){
-        return false;
-    }
-
-    std::string sql = "SELECT id FROM users WHERE username='" + escape(mysql, username) + "' LIMIT 1";
-    if(mysql_query(static_cast<MYSQL*>(mysql), sql.c_str()) != 0){
-        std::cout << outHead("error") << "MySQL 查询用户失败：" << mysql_error(static_cast<MYSQL*>(mysql)) << std::endl;
-        releaseConnection(mysql);
-        return false;
-    }
-
-    MYSQL_RES *res = mysql_store_result(static_cast<MYSQL*>(mysql));
-    bool exists = (res != nullptr && mysql_num_rows(res) > 0);
-    if(res != nullptr){
-        mysql_free_result(res);
-    }
-    releaseConnection(mysql);
-    return exists;
-}
-
-bool MysqlClient::saveUser(const std::string &username, const std::string &passwordHash){
-    void *mysql = acquireConnection();
-    if(mysql == nullptr){
-        return false;
-    }
-    std::string sql = "INSERT INTO users(username,password_hash) VALUES('" +
-                      escape(mysql, username) + "','" + escape(mysql, passwordHash) + "')";
-    bool ok = execute(mysql, sql);
-    releaseConnection(mysql);
-    return ok;
-}
-
-bool MysqlClient::getUserPasswordHash(const std::string &username, std::string &passwordHash){
-    void *mysql = acquireConnection();
-    if(mysql == nullptr){
-        return false;
-    }
-
-    std::string sql = "SELECT password_hash FROM users WHERE username='" + escape(mysql, username) + "' LIMIT 1";
-    if(mysql_query(static_cast<MYSQL*>(mysql), sql.c_str()) != 0){
-        std::cout << outHead("error") << "MySQL 查询用户密码失败：" << mysql_error(static_cast<MYSQL*>(mysql)) << std::endl;
-        releaseConnection(mysql);
-        return false;
-    }
-
-    MYSQL_RES *res = mysql_store_result(static_cast<MYSQL*>(mysql));
-    bool found = false;
-    if(res != nullptr){
-        MYSQL_ROW row = mysql_fetch_row(res);
-        if(row != nullptr && row[0] != nullptr){
-            passwordHash = row[0];
-            found = true;
-        }
-        mysql_free_result(res);
-    }
-    releaseConnection(mysql);
-    return found;
-}
-
-bool MysqlClient::upsertFileMeta(const std::string &username, const std::string &filename,
-                                 unsigned long fileSize, size_t fileHash, long uploadTime){
-    void *mysql = acquireConnection();
-    if(mysql == nullptr){
-        return false;
-    }
-    std::string sql = "INSERT INTO files(username,filename,file_size,file_hash,upload_time,download_count) VALUES('" +
-                      escape(mysql, username) + "','" + escape(mysql, filename) + "'," + std::to_string(fileSize) + ",'" +
-                      std::to_string(fileHash) + "',FROM_UNIXTIME(" + std::to_string(uploadTime) + "),0) "
-                      "ON DUPLICATE KEY UPDATE file_size=VALUES(file_size),file_hash=VALUES(file_hash),"
-                      "upload_time=VALUES(upload_time)";
-    bool ok = execute(mysql, sql);
-    releaseConnection(mysql);
-    return ok;
-}
-
-bool MysqlClient::increaseDownloadCount(const std::string &username, const std::string &filename){
-    void *mysql = acquireConnection();
-    if(mysql == nullptr){
-        return false;
-    }
-    std::string sql = "UPDATE files SET download_count=download_count+1 WHERE username='" +
-                      escape(mysql, username) + "' AND filename='" + escape(mysql, filename) + "'";
-    bool ok = execute(mysql, sql);
-    releaseConnection(mysql);
-    return ok;
-}
-
-bool MysqlClient::removeFileMeta(const std::string &username, const std::string &filename){
-    void *mysql = acquireConnection();
-    if(mysql == nullptr){
-        return false;
-    }
-    std::string sql = "DELETE FROM files WHERE username='" + escape(mysql, username) +
-                      "' AND filename='" + escape(mysql, filename) + "'";
-    bool ok = execute(mysql, sql);
-    releaseConnection(mysql);
-    return ok;
 }

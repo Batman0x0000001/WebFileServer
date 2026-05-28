@@ -5,10 +5,12 @@
 #include <fstream>
 #include <random>
 #include <vector>
+#include <openssl/evp.h>
 
 #include "../cache/redisclient.h"
 #include "../config/config.h"
 #include "../database/mysqlclient.h"
+#include "../utils/http_helpers.h"
 
 namespace{
 
@@ -25,6 +27,8 @@ std::string bytesToHex(const unsigned char *data, size_t len){
         out.push_back(hex[data[i] & 0x0f]);
     }
     return out;
+}
+
 }
 
 std::string sha256Hex(const std::string &input){
@@ -101,6 +105,11 @@ std::string sha256Hex(const std::string &input){
     return bytesToHex(digest, sizeof(digest));
 }
 
+namespace{
+
+const int PBKDF2_ITERATIONS = 120000;
+const size_t PBKDF2_KEY_BYTES = 32;
+
 std::string secureRandomHex(size_t bytes){
     std::vector<unsigned char> data(bytes);
     std::ifstream randomFile("/dev/urandom", std::ios::in | std::ios::binary);
@@ -118,13 +127,30 @@ std::string secureRandomHex(size_t bytes){
     return bytesToHex(data.data(), data.size());
 }
 
-std::string hashPassword(const std::string &password){
-    std::string salt = secureRandomHex(16);
-    return "sha256$" + salt + "$" + sha256Hex(salt + password);
+bool constantTimeEqual(const std::string &left, const std::string &right){
+    if(left.size() != right.size()){
+        return false;
+    }
+    unsigned char diff = 0;
+    for(size_t i = 0; i < left.size(); ++i){
+        diff |= static_cast<unsigned char>(left[i] ^ right[i]);
+    }
+    return diff == 0;
 }
 
-bool verifyPassword(const std::string &password, const std::string &storedHash){
-    std::string prefix = "sha256$";
+std::string pbkdf2HashHex(const std::string &password, const std::string &salt, int iterations){
+    std::vector<unsigned char> key(PBKDF2_KEY_BYTES);
+    int ok = PKCS5_PBKDF2_HMAC(password.c_str(), static_cast<int>(password.size()),
+                               reinterpret_cast<const unsigned char*>(salt.data()), static_cast<int>(salt.size()),
+                               iterations, EVP_sha256(), static_cast<int>(key.size()), key.data());
+    if(ok != 1){
+        return "";
+    }
+    return bytesToHex(key.data(), key.size());
+}
+
+bool verifySha256Password(const std::string &password, const std::string &storedHash){
+    const std::string prefix = "sha256$";
     if(storedHash.find(prefix) != 0){
         return false;
     }
@@ -134,9 +160,49 @@ bool verifyPassword(const std::string &password, const std::string &storedHash){
     }
     std::string salt = storedHash.substr(prefix.size(), sepIndex - prefix.size());
     std::string expected = storedHash.substr(sepIndex + 1);
-    return sha256Hex(salt + password) == expected;
+    return constantTimeEqual(sha256Hex(salt + password), expected);
 }
 
+}
+
+std::string hashPassword(const std::string &password){
+    std::string salt = secureRandomHex(16);
+    std::string hash = pbkdf2HashHex(password, salt, PBKDF2_ITERATIONS);
+    if(hash.empty()){
+        return "";
+    }
+    return "pbkdf2_sha256$" + std::to_string(PBKDF2_ITERATIONS) + "$" + salt + "$" + hash;
+}
+
+bool verifyPassword(const std::string &password, const std::string &storedHash){
+    const std::string prefix = "pbkdf2_sha256$";
+    if(storedHash.find(prefix) != 0){
+        return verifySha256Password(password, storedHash);
+    }
+
+    std::string::size_type iterEnd = storedHash.find('$', prefix.size());
+    if(iterEnd == std::string::npos){
+        return false;
+    }
+    std::string::size_type saltEnd = storedHash.find('$', iterEnd + 1);
+    if(saltEnd == std::string::npos){
+        return false;
+    }
+
+    int iterations = 0;
+    try{
+        iterations = std::stoi(storedHash.substr(prefix.size(), iterEnd - prefix.size()));
+    }catch(...){
+        return false;
+    }
+    if(iterations <= 0){
+        return false;
+    }
+
+    std::string salt = storedHash.substr(iterEnd + 1, saltEnd - iterEnd - 1);
+    std::string expected = storedHash.substr(saltEnd + 1);
+    std::string actual = pbkdf2HashHex(password, salt, iterations);
+    return !actual.empty() && constantTimeEqual(actual, expected);
 }
 
 bool isValidUsername(const std::string &username){
@@ -154,6 +220,9 @@ bool isValidUsername(const std::string &username){
 
 bool saveUser(const std::string &username, const std::string &password){
     std::string passwordHash = hashPassword(password);
+    if(passwordHash.empty()){
+        return false;
+    }
 
     if(MysqlClient::instance().userExists(username)){
         return false;
@@ -178,6 +247,11 @@ bool getUserByToken(const std::string &token, std::string &username){
         return false;
     }
     return RedisClient::instance().get("session:" + token, username);
+}
+
+bool getLoginUserFromCookie(const std::string &cookie, std::string &username){
+    std::string token = getTokenFromCookie(cookie);
+    return getUserByToken(token, username);
 }
 
 void deleteSessionToken(const std::string &token){

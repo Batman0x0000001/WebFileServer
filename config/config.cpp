@@ -4,19 +4,10 @@
 #include <fstream>
 #include <iostream>
 
-#include "../utils/utils.h"
+#include "../utils/log.h"
+#include "../utils/string_utils.h"
 
 namespace{
-
-// 去掉配置行首尾空白，便于解析 key=value。
-std::string trim(const std::string &str){
-    std::string::size_type begin = str.find_first_not_of(" \t\r\n");
-    if(begin == std::string::npos){
-        return "";
-    }
-    std::string::size_type end = str.find_last_not_of(" \t\r\n");
-    return str.substr(begin, end - begin + 1);
-}
 
 // 只接受正整数；配置非法时继续使用已有默认值。
 int parsePositiveInt(const std::string &value, int defaultValue){
@@ -52,7 +43,7 @@ bool parseBool(const std::string &value, bool defaultValue){
 
 AppConfig::AppConfig()
     : m_port(8888), m_threadNum(4), m_idleTimeout(60), m_timerInterval(5),
-      m_storageDir("filedir"), m_logFile("logs/server.log"),
+      m_maxConnection(1024), m_storageDir("filedir"), m_logFile("logs/server.log"),
       m_mysqlEnable(false), m_mysqlHost("127.0.0.1"),
       m_mysqlPort(3306), m_mysqlUser("root"), m_mysqlPassword(""), m_mysqlDatabase("web_file_server"),
       m_redisEnable(false), m_redisHost("127.0.0.1"), m_redisPort(6379), m_redisPassword(""),
@@ -71,13 +62,17 @@ bool AppConfig::load(const std::string &configPath){
         return false;
     }
 
+    //一行一行读取，trim() 去除每行首尾的空白字符。
     std::string line;
     while(std::getline(configStream, line)){
         std::string cleanLine = trim(line);
+        
+        //跳过两类行：空行 或者# 开头的注释行
         if(cleanLine.empty() || cleanLine[0] == '#'){
             continue;
         }
 
+        //找到 = 的位置，找不到则跳过该行。
         std::string::size_type equalIndex = cleanLine.find('=');
         if(equalIndex == std::string::npos){
             continue;
@@ -92,6 +87,7 @@ bool AppConfig::load(const std::string &configPath){
               << ", thread_num=" << m_threadNum
               << ", idle_timeout=" << m_idleTimeout
               << ", timer_interval=" << m_timerInterval
+              << ", max_connection=" << m_maxConnection
               << ", storage_dir=" << m_storageDir
               << ", log_file=" << m_logFile
               << ", mysql_enable=" << (m_mysqlEnable ? "true" : "false")
@@ -115,6 +111,10 @@ int AppConfig::idleTimeout() const{
 
 int AppConfig::timerInterval() const{
     return m_timerInterval;
+}
+
+int AppConfig::maxConnection() const{
+    return m_maxConnection;
 }
 
 const std::string& AppConfig::storageDir() const{
@@ -190,6 +190,8 @@ void AppConfig::setValue(const std::string &key, const std::string &value){
         m_idleTimeout = parsePositiveInt(value, m_idleTimeout);
     }else if(key == "timer_interval"){
         m_timerInterval = parsePositiveInt(value, m_timerInterval);
+    }else if(key == "max_connection"){
+        m_maxConnection = parsePositiveInt(value, m_maxConnection);
     }else if(key == "storage_dir" && !value.empty()){
         m_storageDir = value;
     }else if(key == "log_file" && !value.empty()){

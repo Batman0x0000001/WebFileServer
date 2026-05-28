@@ -38,18 +38,3 @@ std::string urlEncode(const std::string &value){
     }
     return encoded;
 }
-
-std::string htmlEscape(const std::string &value){
-    std::string escaped;
-    for(const auto &ch : value){
-        switch(ch){
-            case '&': escaped += "&amp;"; break;
-            case '<': escaped += "&lt;"; break;
-            case '>': escaped += "&gt;"; break;
-            case '"': escaped += "&quot;"; break;
-            case '\'': escaped += "&#39;"; break;
-            default: escaped += ch; break;
-        }
-    }
-    return escaped;
-}

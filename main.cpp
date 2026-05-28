@@ -1,7 +1,9 @@
-#include "./fileserver/fileserver.h"
+#include "./server/server.h"
 #include "./config/config.h"
 #include "./database/mysqlclient.h"
 #include "./cache/redisclient.h"
+#include "./utils/log.h"
+#include <iostream>
 #include <signal.h>
 #include <unistd.h>
 

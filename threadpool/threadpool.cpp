@@ -1,5 +1,10 @@
 #include "threadpool.h"
 
+#include <iostream>
+
+#include "../event/event_handler.h"
+#include "../utils/log.h"
+
 ThreadPool::ThreadPool(int threadNum) : m_threadNum(threadNum), m_isStop(false){
     if(m_threadNum <= 0){
         throw std::runtime_error("线程数量非法");
@@ -15,10 +20,10 @@ ThreadPool::ThreadPool(int threadNum) : m_threadNum(threadNum), m_isStop(false){
 
 ThreadPool::~ThreadPool(){
     {
-        std::lock_guard<std::mutex> locker(queueLocker);
+        std::lock_guard<std::mutex> locker(m_queueMutex);
         m_isStop = true;
     }
-    queueCond.notify_all();
+    m_queueCond.notify_all();
 
     for(auto &thread : m_threads){
         if(thread.joinable()){
@@ -37,7 +42,7 @@ int ThreadPool::appendEvent(std::unique_ptr<EventBase> event, const std::string 
     }
 
     {
-        std::lock_guard<std::mutex> locker(queueLocker);
+        std::lock_guard<std::mutex> locker(m_queueMutex);
         if(m_isStop){
             std::cout << outHead("error") << "线程池正在停止，拒绝添加新事件" << std::endl;
             return -2;
@@ -46,7 +51,7 @@ int ThreadPool::appendEvent(std::unique_ptr<EventBase> event, const std::string 
         std::cout << outHead("info") << eventType << "添加成功，线程池事件队列中剩余的事件个数：" << m_workQueue.size() << std::endl;
     }
 
-    queueCond.notify_one();
+    m_queueCond.notify_one();
     return 0;
 }
 
@@ -55,8 +60,8 @@ void ThreadPool::run(int threadNo){
     while(1){
         std::unique_ptr<EventBase> curEvent;
         {
-            std::unique_lock<std::mutex> locker(queueLocker);
-            queueCond.wait(locker, [this](){
+            std::unique_lock<std::mutex> locker(m_queueMutex);
+            m_queueCond.wait(locker, [this](){
                 return m_isStop || !m_workQueue.empty();
             });
 
